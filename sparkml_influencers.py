@@ -1,67 +1,71 @@
 
-from pyspark.sql import SparkSession
+import happybase
+from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import LinearRegression
-import happybase
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-# Step 1: Create a Spark session connected to Hive
-spark = SparkSession.builder \
-    .appName("Influencer ML Prediction") \
-    .enableHiveSupport() \
-    .getOrCreate()
 
-# Step 2: Load data from your Hive table 'influencers_2026'
-query = """
-    SELECT posts, followers, avg_likes, eng_rate_60_day, influence_score 
-    FROM influencers_2026
-"""
-influencers_df = spark.sql(query)
+def main():
+    spark = (
+        SparkSession.builder
+        .appName("Influencer_to_HBase")
+        .enableHiveSupport()
+        .getOrCreate()
+    )
 
-# Step 3: Handle null values by dropping them
-influencers_df = influencers_df.na.drop()
+    feature_cols = ["posts", "followers", "avg_likes", "eng_rate_60_day"]
+    label_col = "influence_score"
 
-# Step 4: Prepare features for MLlib
-assembler = VectorAssembler(
-    inputCols=["posts", "followers", "avg_likes", "eng_rate_60_day"],
-    outputCol="features",
-    handleInvalid="skip"
-)
-assembled_df = assembler.transform(influencers_df).select("features", "influence_score")
+    influencers_df = spark.sql("SELECT * FROM influencers_2026")
 
-# Step 5: Split data into training (70%) and testing (30%) sets
-train_data, test_data = assembled_df.randomSplit([0.7, 0.3], seed=42)
+    # Cast string columns from OpenCSVSerde to numeric types and drop nulls
+    casted_df = influencers_df
+    for col_name in feature_cols + [label_col]:
+        casted_df = casted_df.withColumn(col_name, F.col(col_name).cast("double"))
 
-# Step 6: Initialize and train the Linear Regression model
-lr = LinearRegression(labelCol="influence_score")
-lr_model = lr.fit(train_data)
+    clean_df = casted_df.dropna(subset=feature_cols + [label_col])
 
-# Step 7: Evaluate the model on the test data
-test_results = lr_model.evaluate(test_data)
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+    assembled_df = assembler.transform(clean_df).select("features", label_col)
 
-# Step 8: Print performance metrics
-print(f"--- Influencer ML Model Results ---")
-print(f"RMSE: {test_results.rootMeanSquaredError}")
-print(f"R^2: {test_results.r2}")
+    train_df, test_df = assembled_df.randomSplit([0.8, 0.2], seed=42)
 
-# ---- Write metrics to HBase with Happybase ----
-metrics_data = [
-    ('influencer_metric_1', 'cf:rmse', str(test_results.rootMeanSquaredError)),
-    ('influencer_metric_1', 'cf:r2',   str(test_results.r2)),
-]
+    lr = LinearRegression(featuresCol="features", labelCol=label_col)
+    model = lr.fit(train_df)
+    predictions = model.transform(test_df)
 
-def write_to_hbase_partition(partition):
-    # Connect to HBase Thrift server running on the master node
-    connection = happybase.Connection('master', port=9090)
+    rmse_evaluator = RegressionEvaluator(
+        labelCol=label_col, predictionCol="prediction", metricName="rmse"
+    )
+    r2_evaluator = RegressionEvaluator(
+        labelCol=label_col, predictionCol="prediction", metricName="r2"
+    )
+
+    rmse = rmse_evaluator.evaluate(predictions)
+    r2 = r2_evaluator.evaluate(predictions)
+
+    print(f"RMSE: {rmse}")
+    print(f"R2: {r2}")
+
+    # Write metrics to HBase table 'influencers_table_2026' under column family 'cf'
+    connection = happybase.Connection("localhost")
     connection.open()
-    table = connection.table('influencers_table_2026')
-    for row in partition:
-        row_key, column, value = row
-        table.put(row_key, {column: value})
-    connection.close()
+    try:
+        table = connection.table("influencers_table_2026")
+        table.put(
+            b"influencer_metric_1",
+            {
+                b"cf:rmse": str(rmse).encode("utf-8"),
+                b"cf:r2": str(r2).encode("utf-8"),
+            },
+        )
+    finally:
+        connection.close()
 
-# Parallelize metrics and push to HBase via foreachPartition
-rdd = spark.sparkContext.parallelize(metrics_data)
-rdd.foreachPartition(write_to_hbase_partition)
+    spark.stop()
 
-# Step 9: Stop Spark session
-spark.stop()
+
+if __name__ == "__main__":
+    main()
